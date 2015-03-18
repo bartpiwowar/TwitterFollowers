@@ -91,7 +91,7 @@ def cleanup (cur,conn,dead_followers,twitter_user):
 if __name__ == '__main__':
     
     # Twitter user 
-    twitter_users = ['real_genevieve']    
+    twitter_users = ['Chicopee_Resort']    
     #twitter_users = ['alisonvictoria3']
     
     #initialize twitter api

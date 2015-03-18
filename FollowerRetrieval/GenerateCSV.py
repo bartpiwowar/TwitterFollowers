@@ -67,8 +67,9 @@ if __name__ == '__main__':
     # Open a cursor to perform database operations
     cur = conn.cursor()
     
-    twitter_users = ['MrDrewScott', 'MrSilverScott']
-    target_users = ['bromco','Make_It_Right','ChrisLambton13','VernYipDesigns','em_henderson','SarahR_Design','sabrinasoto']
+    #twitter_users = ['MrDrewScott', 'MrSilverScott']
+    twitter_users = []
+    target_users = ['Chicopee_Resort']
     
     twitter_users_sets = {}
     

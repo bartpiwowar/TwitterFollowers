@@ -6,8 +6,15 @@ from functools import partial
 from sys import maxint
 import sys
 from TwitterRequest import make_twitter_request
+import datetime
 import time
+from datetime import datetime as date
 from Twitter import oauth_login
+
+
+
+database_followers = 'twitter_followers'
+database_reports = 'twitter_followers_reports'
 
 def followers_ids_to_mongodb(collection, twitter_api, screen_name=None, user_id=None,
                               friends_limit=maxint, followers_limit=maxint, database=None):
@@ -110,7 +117,7 @@ def save_to_mongo(data, mongo_db, mongo_db_coll, **mongo_conn_kw):
     count = 0
     for value in data:
         try:
-            coll.insert({"_id":value})
+            coll.insert({"_id":value,"fetch_time":datetime.datetime.utcnow()})
             count += 1
         except pymongo.errors.DuplicateKeyError:
             print >> sys.stderr, 'duplicate twitter user id ', value
@@ -162,6 +169,8 @@ def update_follower_info(data,mongo_db, mongo_db_coll, **mongo_conn_kw):
     # update documents with profile info
     # return coll.insert_many([{'id': i} for i in data])
     for key in data:
+        if data[key] == None:
+            print >> sys.stderr, 'twitter user id not valid ',key,json.dumps(data[key], indent=4)
         try:
             collection.update({"_id":key},{"$set":data[key]} , upsert=True)
         except pymongo.errors.DuplicateKeyError:
@@ -172,7 +181,7 @@ def update_follower_info(data,mongo_db, mongo_db_coll, **mongo_conn_kw):
     client.disconnect()    
     
 
-def get_follower_profiles(screen_name,app_user,twitter_oauth):
+def get_follower_profiles(screen_name,app_user,twitter_oauth,idsOnly = False):
     
     collection = '{0}_{1}'.format(app_user, screen_name)
     database = 'twitter_followers'
@@ -183,32 +192,169 @@ def get_follower_profiles(screen_name,app_user,twitter_oauth):
                                 friends_limit=0, database='twitter_followers')    
     print >> sys.stderr, 'Saved {0} follower ids'.format(result)
      
-    # step 2: get follower info
-    cursor = get_followers_from_mongo(database, collection)
-    ids = []
-    i = 0
-    for item in cursor:      
-        ids.append(item['_id'])
-        i += 1
-        if len(ids) == 100 or cursor.count() == i:
-            #print '{0} {1}'.format(len(ids), i)
-            results = get_user_profile(twitter_oauth, user_ids=ids) 
-            update_follower_info(results,database, collection)
-            #print json.dumps(result, indent=4)
-            ids = []    
-    print >> sys.stderr, 'Updated {0} follower profiles for {1}'.format(i,collection)
-    cursor.close()
+    if not idsOnly:
+        # step 2: get follower info
+        print >> sys.stderr, 'Getting follower profile info for {0}'.format(collection)
+        cursor = get_followers_from_mongo(database, collection)
+        ids = []
+        i = 0
+        for item in cursor:      
+            ids.append(item['_id'])
+            i += 1
+            if len(ids) == 100 or cursor.count() == i:
+                #print '{0} {1}'.format(len(ids), i)
+                results = get_user_profile(twitter_oauth, user_ids=ids) 
+                update_follower_info(results,database, collection)
+                #print json.dumps(result, indent=4)
+                ids = []    
+        print >> sys.stderr, 'Updated {0} follower profiles for {1}'.format(i,collection)
+        cursor.close()
     
+def generate_report(target_users,compare_to_users,app_user,**mongo_conn_kw):
+    
+    
+    # create report collection
+    client = pymongo.MongoClient(**mongo_conn_kw)
+    
+    #init collections 
+    target_user_coll = client[database_followers]['{0}_{1}'.format(app_user, target_users)]
+    reports_coll = client[database_reports]['reports']
+         
+    info = {'app_user':app_user,'target_users':target_users,'compare_to_users':compare_to_users, 'report_date':datetime.datetime.utcnow()}
+    
+    compare_to_user_cursor = get_followers_from_mongo(database_followers, '{0}_{1}'.format(app_user, compare_to_users))
+    for item in compare_to_user_cursor:
+        
+        try:
+            # follower info
+            d = date.strptime(item["created_at"],'%a %b %d %H:%M:%S +0000 %Y')
+            report_row = {"info":info,
+                          "name":item["name"] ,
+                          "screen_name":item["screen_name"],
+                          "followers_count":item["followers_count"],
+                          "friends_count":item["friends_count"],
+                          "statuses_count":item["statuses_count"],
+                          "created_at": d.strftime('%Y-%m-%d'),
+                          "verified":item["verified"]   }
+            if  target_user_coll.find_one({"_id": item['_id']}):
+                report_row["follows_"+target_users]=True
+            else:
+                report_row["follows_"+target_users]=False
+            
+            #TODO check if target user follows the compare to user (friends list) 
+            reports_coll.insert(report_row)
+            
+        except Exception as e:
+            print >> sys.stderr, 'Failed to compared for user {0} and follower Id {1}'.format(compare_to_users,item)
+        
+          
+    compare_to_user_cursor.close()     
+    client.disconnect() 
+    print >> sys.stderr, 'Generated report for Target users: {0} , Compare to users:{1}'.format(target_users,compare_to_users)   
+
+def follower_data_expired(app_user,target_users,timedelta=0,**mongo_conn_kw):
+    # Get a reference to a particular database
+    try:
+        client = pymongo.MongoClient(**mongo_conn_kw)
+        collection = client[database_followers]['{0}_{1}'.format(app_user, target_users)]
+        cursor = collection.find_one(timeout=False)
+
+        delta = datetime.datetime.utcnow() - cursor["fetch_time"]
+        hours = delta.total_seconds()/3600
+        print >> sys.stderr, 'Follower data age is {0} hours old for {1}'.format(hours,'{0}_{1}'.format(app_user, target_users))
+        if hours > timedelta:
+            return True
+        else:
+            return False
+    except Exception:
+        print >> sys.stderr, 'Failed to check for follower data age for {0}'.format('{0}_{1}'.format(app_user, target_users))
+        print >> sys.stderr, 'Error type ',sys.exc_info()
+        return True
+
+def compare_workflow(target_users,compare_to_users,app_user,twitter_oauth):
+    
+    
+    # get twitter user's followers info 
+    # check if recent data exists
+    if follower_data_expired(app_user,target_users,timedelta=0):
+        start_time = time.time()
+        get_follower_profiles(target_users,app_user,twitter_oauth,idsOnly = True)
+        print "Time getting follower id: ", (time.time() - start_time)/60, " minutes"
+     
+    # get compare to users
+    # we always get renew this data
+    start_time = time.time()    
+    get_follower_profiles(compare_to_users,app_user,twitter_oauth)
+    print "Time getting follower profiles: ", (time.time() - start_time)/60, " minutes"
+    
+    start_time = time.time()
+    generate_report(target_users,compare_to_users,app_user)
+    print "Time generating report: ", (time.time() - start_time)/60, " minutes"
+
 
 if __name__ == '__main__':
     
     # Sample usage
-    screen_name = 'green_lemonnn'
+    target_users = 'mrdrewscott'
+    compare_to_users = 'eventpeeks'
     app_user = 'bart'
     
-     # twitter user tokens
+    # twitter user tokens
     twitter_oauth = oauth_login() 
-  
-    # get twitter user's followers info 
-    get_follower_profiles(screen_name.lower(),app_user,twitter_oauth)
+
+    compare_workflow(target_users.lower(),compare_to_users.lower(),app_user.lower(),twitter_oauth)
     
+    
+#################################
+# Sample follower info document in mongodb
+#################################
+# {
+#     "_id" : NumberLong("3092915712"),
+#     "follow_request_sent" : false,
+#     "profile_use_background_image" : true,
+#     "profile_text_color" : "333333",
+#     "default_profile_image" : true,
+#     "id" : NumberLong("3092915712"),
+#     "profile_background_image_url_https" : "https://abs.twimg.com/images/themes/theme1/bg.png",
+#     "verified" : false,
+#     "profile_location" : null,
+#     "profile_image_url_https" : "https://abs.twimg.com/sticky/default_profile_images/default_profile_5_normal.png",
+#     "profile_sidebar_fill_color" : "DDEEF6",
+#     "entities" : {
+#         "description" : {
+#             "urls" : [ ]
+#         }
+#     },
+#     "followers_count" : 11,
+#     "profile_sidebar_border_color" : "C0DEED",
+#     "id_str" : "3092915712",
+#     "profile_background_color" : "C0DEED",
+#     "listed_count" : 0,
+#     "is_translation_enabled" : false,
+#     "utc_offset" : null,
+#     "statuses_count" : 0,
+#     "description" : "",
+#     "friends_count" : 331,
+#     "location" : "",
+#     "profile_link_color" : "0084B4",
+#     "profile_image_url" : "http://abs.twimg.com/sticky/default_profile_images/default_profile_5_normal.png",
+#     "following" : false,
+#     "geo_enabled" : false,
+#     "profile_background_image_url" : "http://abs.twimg.com/images/themes/theme1/bg.png",
+#     "name" : "Hahxuax",
+#     "lang" : "en",
+#     "profile_background_tile" : false,
+#     "favourites_count" : 0,
+#     "screen_name" : "hahxuax",
+#     "notifications" : false,
+#     "url" : null,
+#     "created_at" : "Tue Mar 17 09:01:34 +0000 2015",
+#     "contributors_enabled" : false,
+#     "time_zone" : null,
+#     "protected" : false,
+#     "default_profile" : true,
+#     "is_translator" : false
+# }
+
+
+
